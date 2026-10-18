@@ -1,20 +1,146 @@
-/*! Hudson & Fifth Realty chat widget 1.0.0
- *  One <script> tag, no dependencies. Talks only to the chat proxy (data-api); it never holds a Vapi key.
- *  <script src=".../hudson-chat.js" data-api="https://your-proxy.workers.dev" defer></script>
- *  Options (data-*): api, theme (auto|light|dark), position (right|left), open (true), title, subtitle, greeting, placeholder,
- *  phone, email, privacy-url, accent, brand, teaser (true|false), teaser-text, bottom, side, z, chips (JSON).
+/*! Hudson & Fifth Realty chat widget 2.0.0
+ *  One <script> tag, no dependencies, no server of our own. It talks straight to Vapi's browser chat route with your PUBLIC key.
+ *  <script src=".../hudson-chat.js" data-public-key="YOUR_VAPI_PUBLIC_KEY" defer></script>
+ *  NEVER put the private Vapi key in a web page. Restrict the public key to your websites and to this one assistant
+ *  (Vapi dashboard > API Keys > Public API Keys > Allowed Origins and Allowed Assistants).
+ *  Options (data-*): public-key (required), assistant-id, api-url, note-mode (developer|system|user_prefix|none), theme (auto|light|dark),
+ *  position (right|left), open (true), title, subtitle, greeting, placeholder, phone, email, privacy-url, accent, brand,
+ *  teaser (true|false), teaser-text, bottom, side, z, chips (JSON).
  */
 (function () {
   'use strict';
   if (window.HudsonChat && window.HudsonChat.version) return;
 
-  var BAKED_API = '';
+  var BAKED_ASSISTANT = "a83ddf07-bc90-4372-a031-756d811067c0";
+  var BAKED_API_URL = "https://api.vapi.ai";
+  // Protocol logic shared by the widget and the live-test script: how a chat message is sent to Vapi and how the answer is read.
+// Plain functions, no DOM, no globals. The build inlines this file into the widget (the word "export" is stripped); Node tools import it.
+//
+// Vapi's browser chat route (the one Vapi's own widget uses): POST {apiUrl}/chat/web with "Authorization: Bearer <PUBLIC key>".
+// It refuses the private key. Answer = Server-Sent Events: data: {"sessionId","path":"chat.output[0].content","delta":"..."} ... data: [DONE]
+function createCore(CHAT_NOTE) {
+  // maps a Vapi failure (HTTP status and/or message text) to one of our error codes
+  function classify(status, message) {
+    var m = String(message || '');
+    if (/session not found|session .*(expired|ended)/i.test(m)) return 'session_invalid';
+    if (status === 402 || /payment|billing|card on file|credit|insufficient/i.test(m)) return 'chat_unavailable';
+    if (status === 401 || status === 403 || /invalid key|unauthorized|forbidden|origin|not allowed/i.test(m)) return 'key_rejected';
+    if (status === 429) return 'busy';
+    if (status === 408 || status === 504) return 'timeout';
+    if (status === 400 || status === 422) return 'bad_request';
+    return 'upstream_error';
+  }
+
+  // What to send. c = {mode, sid, msgs, greeting, assistantId}. Once Vapi has given us a session id, only the new message is sent
+  // (Vapi keeps the conversation in the session). Before that, the text-chat note + greeting + any earlier messages go along.
+  function buildBody(c, text) {
+    var input;
+    if (c.sid) input = text;
+    else {
+      input = [];
+      if (c.mode === 'developer' || c.mode === 'system') input.push({ role: c.mode, content: CHAT_NOTE });
+      input.push({ role: 'assistant', content: c.greeting });
+      var prefixed = c.mode !== 'user_prefix';
+      c.msgs.forEach(function (m) {
+        var t = m.t;
+        if (!prefixed && m.r === 'u') { t = CHAT_NOTE + '\n\nVisitor message: ' + t; prefixed = true; }
+        input.push({ role: m.r === 'u' ? 'user' : 'assistant', content: t });
+      });
+      input.push({ role: 'user', content: prefixed ? text : CHAT_NOTE + '\n\nVisitor message: ' + text });
+    }
+    var body = { input: input, assistantId: c.assistantId, stream: true };
+    if (c.sid) body.sessionId = c.sid;
+    return body;
+  }
+
+  function errText(j) {
+    if (typeof j.message === 'string' && j.message) return j.message;
+    if (typeof j.error === 'string') return j.error;
+    if (j.error && typeof j.error === 'object' && j.error.message) return String(j.error.message);
+    return 'Unknown error';
+  }
+
+  // Reads Vapi's chat stream. Only assistant text is shown (paths chat.output[N].content). A segment that starts with { or [ and
+  // is valid JSON is a tool result, not speech, and is dropped. Answers split around a tool call are joined by a blank line.
+  function makeParser(onText, onSession) {
+    var segs = {}, emitted = 0, fallback = '', MAX = 4000;
+    var p = { error: null, sessionId: '' };
+    function take(t) { if (!t) return ''; var room = MAX - emitted; if (room <= 0) return ''; if (t.length > room) t = t.slice(0, room); emitted += t.length; return t; }
+    function isJson(t) { try { JSON.parse(t); return true; } catch (e) { return false; } }
+    p.handle = function (j) {
+      if (j.sessionId && !p.sessionId) { p.sessionId = String(j.sessionId); onSession(p.sessionId); }
+      if (j.error === true || typeof j.error === 'string' || (j.error && typeof j.error === 'object') || j.type === 'error') { p.error = errText(j); return; }
+      if (typeof j.delta === 'string' && typeof j.path === 'string') {
+        var m = /^chat\.output\[(\d+)\]\.content$/.exec(j.path);
+        if (!m) return;
+        var seg = segs[m[1]] || (segs[m[1]] = { mode: 'pending', text: '' });
+        seg.text += j.delta;
+        if (seg.mode === 'pending') {
+          var f = seg.text.replace(/^\s+/, '').charAt(0);
+          if (!f) return;
+          seg.mode = f === '{' || f === '[' ? 'hold' : 'text';
+          if (seg.mode === 'text') onText(take((emitted > 0 ? '\n\n' : '') + seg.text.replace(/^\s+/, '')));
+        } else if (seg.mode === 'text') onText(take(j.delta));
+      } else if (typeof j.output === 'string' && j.output) fallback = j.output;
+      else if (Array.isArray(j.output)) {
+        var t = j.output.filter(function (o) { return o && o.role === 'assistant' && typeof o.content === 'string' && o.content.trim(); }).map(function (o) { return o.content.trim(); }).join('\n\n');
+        if (t) fallback = t;
+      }
+    };
+    p.finish = function () {
+      Object.keys(segs).forEach(function (k) { var s = segs[k]; if (s.mode === 'hold' && !isJson(s.text)) onText(take((emitted > 0 ? '\n\n' : '') + s.text.trim())); });
+      if (!emitted && fallback) onText(take(fallback.trim()));
+    };
+    return p;
+  }
+
+  // Feeds a fetch() response body (Server-Sent Events) to a parser made by makeParser. If nothing arrives for idleMs, it gives up
+  // (throws an error whose code is 'idle') so a stalled answer never leaves the visitor waiting forever.
+  async function readStream(res, parser, idleMs) {
+    var reader = res.body.getReader(), dec = new TextDecoder(), buf = '';
+    function next() {
+      if (!idleMs) return reader.read();
+      return new Promise(function (resolve, reject) {
+        var timer = setTimeout(function () { try { reader.cancel(); } catch (e) { /* already closed */ } var err = new Error('idle'); err.code = 'idle'; reject(err); }, idleMs);
+        reader.read().then(function (r) { clearTimeout(timer); resolve(r); }, function (e) { clearTimeout(timer); reject(e); });
+      });
+    }
+    function block(blk) {
+      var data = [];
+      blk.split(/\r\n|\n|\r/).forEach(function (l) { if (l.indexOf('data:') === 0) data.push(l.slice(5).replace(/^ /, '')); });
+      var raw = data.join('\n').trim();
+      if (!raw) return false;
+      if (raw === '[DONE]') return true;
+      var j = null; try { j = JSON.parse(raw); } catch (e) { return false; }
+      if (j && typeof j === 'object') parser.handle(j);
+      return false;
+    }
+    for (;;) {
+      var r = await next();
+      if (r.done) break;
+      buf += dec.decode(r.value, { stream: true });
+      var m;
+      while ((m = /\r\n\r\n|\n\n|\r\r/.exec(buf))) {
+        var blk = buf.slice(0, m.index); buf = buf.slice(m.index + m[0].length);
+        if (block(blk)) return;
+      }
+    }
+    if (buf.trim()) block(buf);
+  }
+
+  return { classify: classify, buildBody: buildBody, makeParser: makeParser, readStream: readStream };
+}
+  var CHAT_NOTE = "CHANNEL: this is a TEXT CHAT on the Hudson and Fifth Realty website. The visitor types and reads; nothing is spoken.\n- Ignore any rule that only makes sense on a phone call: do not say the recording sentence (the chat window already shows a notice), never use the end-call tool, and do not say goodbye to end the chat.\n- Reply in plain text, one to three short sentences. When you offer viewing times, put each one on its own line starting with \"- \". No headings, tables, bold text or emojis.\n- Write emails, phone numbers, dates, times and prices normally, for example name@example.com, (646) 555-0121, Thursday at 6:00 PM, $3,200 a month. Never spell anything letter by letter or digit by digit. When you confirm details, repeat them exactly as typed and ask if they are right.\n- Everything else works as usual: use lookup_knowledge for facts, ask the qualification questions one at a time, and use check_availability, book_appointment, save_lead and request_callback as instructed.";      // text-chat instructions sent with the first message of a chat (the voice prompt is not changed)
   var script = document.currentScript || (function () { var s = document.querySelectorAll('script[src*="hudson-chat"]'); return s[s.length - 1] || null; })();
   var D = (script && script.dataset) || {};
   var truthy = function (v, dflt) { return v == null || v === '' ? dflt : !/^(false|0|no|off)$/i.test(v); };
   var DEFAULT_GREETING = "Hi, my name is John. I'm with Hudson and Fifth Realty. How can I help?";
   var CFG = {
-    api: String(D.api || (BAKED_API.indexOf('__') === 0 ? '' : BAKED_API)).replace(/\/+$/, ''),
+    publicKey: String(D.publicKey || '').trim(),
+    assistantId: String(D.assistantId || BAKED_ASSISTANT),
+    apiUrl: String(D.apiUrl || BAKED_API_URL).replace(/\/+$/, ''),
+    clientId: String(D.clientId || 'hudson-fifth-chat'),
+    noteMode: /^(developer|system|user_prefix|none)$/.test(D.noteMode) ? D.noteMode : 'developer',
     theme: /^(light|dark)$/.test(D.theme) ? D.theme : 'auto',
     position: D.position === 'left' ? 'left' : 'right',
     autoOpen: D.open != null && truthy(D.open, false),
@@ -32,6 +158,8 @@
     bottom: parseInt(D.bottom, 10) || 20,
     side: parseInt(D.side, 10) || 20,
     z: parseInt(D.z, 10) || 2147483000,
+    idleMs: parseInt(D.idleMs, 10) || 35000,           // give up if the answer goes quiet this long
+    firstByteMs: parseInt(D.firstByteMs, 10) || 45000, // give up if Vapi does not start answering in this time
     maxChars: 800,
     chips: [
       { label: 'Rent', text: "I'm looking to rent." },
@@ -45,7 +173,7 @@
     if (Array.isArray(custom) && custom.length) CFG.chips = custom.filter(function (x) { return x && x.label && x.text; }).slice(0, 6);
   } catch (e) { /* keep the default chips */ }
 
-  var KEY = 'hfchat:v1';
+  var KEY = 'hfchat:v2';
   var TTL_MS = 3 * 3600 * 1000;
   var MOBILE_Q = '(max-width: 480px)';
 
@@ -214,7 +342,7 @@
   ].join('\n');
 
   // ------------------------------------------------------------------ state
-  var state = { open: false, sid: '', msgs: [], busy: false, unread: 0, abort: null, lastText: '', chipsDone: false, renewed: false };
+  var state = { open: false, sid: '', msgs: [], busy: false, unread: 0, abort: null, lastText: '', chipsDone: false, renewed: false, mode: '', fellBack: false };
   var els = {};
   var mq = window.matchMedia ? window.matchMedia(MOBILE_Q) : { matches: false };
   var scrollLock = null;
@@ -222,14 +350,15 @@
 
   function persist() {
     var s = store(); if (!s) return;
-    try { s.setItem(KEY, JSON.stringify({ v: 1, at: now(), sid: state.sid, open: state.open, chipsDone: state.chipsDone, msgs: state.msgs.slice(-60) })); } catch (e) { /* storage full or blocked */ }
+    try { s.setItem(KEY, JSON.stringify({ v: 2, at: now(), sid: state.sid, open: state.open, chipsDone: state.chipsDone, mode: state.mode, fb: state.fellBack, msgs: state.msgs.slice(-60) })); } catch (e) { /* storage full or blocked */ }
   }
   function restore() {
     var s = store(); if (!s) return false;
     try {
       var d = JSON.parse(s.getItem(KEY) || 'null');
-      if (!d || d.v !== 1 || now() - d.at > TTL_MS) { s.removeItem(KEY); return false; }
+      if (!d || d.v !== 2 || now() - d.at > TTL_MS) { s.removeItem(KEY); return false; }
       state.sid = d.sid || ''; state.msgs = Array.isArray(d.msgs) ? d.msgs : []; state.chipsDone = !!d.chipsDone; state.open = !!d.open;
+      state.mode = d.mode || ''; state.fellBack = !!d.fb;
       return true;
     } catch (e) { return false; }
   }
@@ -355,7 +484,7 @@
       case 'chat_unavailable': return 'Chat is not available right now.' + contact;
       case 'session_limit': return 'This chat has reached its length limit. Please start a new chat to continue.';
       case 'message_too_long': return 'That message is too long. Please shorten it and try again.';
-      case 'origin_not_allowed': return 'Chat is not enabled on this website yet.';
+      case 'key_rejected': return 'Chat is not available on this website right now.' + contact;
       case 'offline': return 'You appear to be offline. Check your connection and try again.';
       case 'upstream_timeout': case 'timeout': return 'That took too long. Please try again.';
       case 'network': return "I couldn't reach the chat service. Check your connection and try again." + contact;
@@ -370,7 +499,7 @@
     if (code === 'session_limit') {
       var nb = h('button', { class: 'btn primary', type: 'button', text: 'Start new chat' });
       nb.addEventListener('click', function () { newChat(true); }); r.bubble.appendChild(nb);
-    } else if (!noRetry && state.lastText && !/^(message_too_long|origin_not_allowed|chat_unavailable)$/.test(code)) {
+    } else if (!noRetry && state.lastText && !/^(message_too_long|key_rejected|chat_unavailable)$/.test(code)) {
       var rb = h('button', { class: 'btn', type: 'button', text: 'Try again' });
       rb.addEventListener('click', function () { r.row.remove(); run(state.lastText, true); });
       r.bubble.appendChild(rb);
@@ -378,26 +507,15 @@
     emit('error', { code: code });
   }
 
-  // ------------------------------------------------------------------ talking to the proxy
-  function apiError(code, status) { var e = new Error(code); e.code = code; e.status = status; return e; }
+  // ------------------------------------------------------------------ talking to Vapi (public key, no server of ours)
+  // POST {apiUrl}/chat/web is the route Vapi's own chat widget uses. It accepts ONLY a public key (it refuses the private key) and
+  // streams Server-Sent Events: data: {"sessionId","path":"chat.output[0].content","delta":"..."}  ...  data: [DONE]
+  var MAX_USER_TURNS = 40;
+  function apiError(code, status, detail) { var e = new Error(code); e.code = code; e.status = status; e.detail = detail; return e; }
 
-  async function readSse(res, onEvent) {
-    var reader = res.body.getReader(), dec = new TextDecoder(), buf = '';
-    for (;;) {
-      var r = await reader.read();
-      if (r.done) break;
-      buf += dec.decode(r.value, { stream: true }).replace(/\r\n/g, '\n');
-      var i;
-      while ((i = buf.indexOf('\n\n')) !== -1) {
-        var blk = buf.slice(0, i); buf = buf.slice(i + 2);
-        var ev = 'message', data = [];
-        blk.split('\n').forEach(function (l) { if (l.indexOf('event:') === 0) ev = l.slice(6).trim(); else if (l.indexOf('data:') === 0) data.push(l.slice(5).replace(/^ /, '')); });
-        if (!data.length) continue;
-        var obj = null; try { obj = JSON.parse(data.join('\n')); } catch (e) { continue; }
-        onEvent(ev, obj);
-      }
-    }
-  }
+  var core = createCore(CHAT_NOTE);          // protocol logic shared with the live-test script (src/core.js, inlined by the build)
+  function classify(status, message) { return core.classify(status, message); }
+  function buildBody(text) { return core.buildBody({ mode: state.mode || CFG.noteMode, sid: state.sid, msgs: state.msgs, greeting: CFG.greeting, assistantId: CFG.assistantId }, text); }
 
   async function run(text, isRetry) {
     if (state.busy) return;
@@ -406,40 +524,47 @@
     showTyping();
     var ac = new AbortController(); state.abort = ac;
     var killer = setTimeout(function () { ac.abort(); }, 90000);
-    var reply = '', bubble = null, streamErr = null, paint = 0, renew = false;
+    var reply = '', bubble = null, paint = 0, renew = false, fallback = false, usedSession = !!state.sid;
     function flush() {
       paint = 0;
       if (!bubble) return;
       var stick = nearBottom(); renderInto(bubble.bubble, reply); bubble.bubble.classList.add('caret'); scrolled(stick);
     }
+    var parser = core.makeParser(function (t) {
+      if (!t) return;
+      if (!bubble) { hideTyping(); bubble = addRow('a', ''); bubble.bubble.classList.add('caret'); }
+      reply += t; if (!paint) paint = requestAnimationFrame(flush);
+    }, function (id) { state.sid = id; persist(); });
     try {
-      if (!CFG.api) throw apiError('chat_unavailable');
+      if (!CFG.publicKey) { if (window.console) console.error('[hudson-chat] data-public-key is missing on the script tag, so chat cannot start.'); throw apiError('chat_unavailable'); }
       if (navigator.onLine === false) throw apiError('offline');
-      var res;
+      var res, firstByte = setTimeout(function () { ac.abort(); }, CFG.firstByteMs);
       try {
-        res = await fetch(CFG.api + '/v1/chat', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ message: text, sid: state.sid || undefined, stream: true }), signal: ac.signal, cache: 'no-store', credentials: 'omit', mode: 'cors' });
-      } catch (e) { throw apiError(ac.signal.aborted ? 'timeout' : 'network'); }
+        res = await fetch(CFG.apiUrl + '/chat/web', {
+          method: 'POST',
+          headers: { Authorization: 'Bearer ' + CFG.publicKey, 'Content-Type': 'application/json', 'X-Client-ID': CFG.clientId },
+          body: JSON.stringify(buildBody(text)), signal: ac.signal, cache: 'no-store', credentials: 'omit', mode: 'cors'
+        });
+      } catch (e) { clearTimeout(firstByte); throw apiError(ac.signal.aborted ? 'timeout' : 'network'); }
+      clearTimeout(firstByte);
       if (!res.ok) {
-        var j = null; try { j = await res.json(); } catch (e) { /* not JSON */ }
-        throw apiError((j && j.error && j.error.code) || 'http_' + res.status, res.status);
+        var txt = ''; try { txt = await res.text(); } catch (e) { /* ignore */ }
+        var msg = txt; try { var jj = JSON.parse(txt); msg = Array.isArray(jj.message) ? jj.message.join('; ') : (jj.message || jj.error || txt); } catch (e) { /* plain text */ }
+        throw apiError(classify(res.status, msg), res.status, String(msg).slice(0, 300));
       }
-      var onEvent = function (ev, d) {
-        if (ev === 'session') { if (d.sid) { state.sid = d.sid; persist(); } }
-        else if (ev === 'delta') {
-          if (!bubble) { hideTyping(); bubble = addRow('a', ''); bubble.bubble.classList.add('caret'); }
-          reply += d.text; if (!paint) paint = requestAnimationFrame(flush);
-        } else if (ev === 'error') streamErr = d.code || 'upstream_error';
-      };
+      var transportErr = null;
       if ((res.headers.get('Content-Type') || '').indexOf('text/event-stream') !== -1 && res.body) {
-        try { await readSse(res, onEvent); } catch (e) { if (!streamErr) streamErr = ac.signal.aborted ? 'timeout' : 'network'; }
+        try { await core.readStream(res, parser, CFG.idleMs); } catch (e) { transportErr = (e && e.code === 'idle') || ac.signal.aborted ? 'timeout' : 'network'; }
       } else {
-        var data = await res.json();
-        if (data && data.sid) { state.sid = data.sid; persist(); }
-        if (data && data.reply) onEvent('delta', { text: data.reply });
+        var data = null; try { data = await res.json(); } catch (e) { /* not JSON */ }
+        if (data && typeof data === 'object') parser.handle(data);
       }
       if (paint) { cancelAnimationFrame(paint); paint = 0; }
+      parser.finish();
+      if (paint) { cancelAnimationFrame(paint); paint = 0; }
       if (bubble) { bubble.bubble.classList.remove('caret'); renderInto(bubble.bubble, reply); }
-      if (streamErr) throw apiError(streamErr);
+      if (parser.error) throw apiError(classify(0, parser.error), 0, parser.error);
+      if (transportErr) throw apiError(transportErr);
       hideTyping();
       if (!bubble) { reply = "Sorry, I didn't catch that. Could you say it another way?"; addRow('a', reply); }
       state.msgs.push({ r: 'u', t: text }, { r: 'a', t: reply }); persist();
@@ -451,11 +576,15 @@
       if (paint) { cancelAnimationFrame(paint); paint = 0; }
       if (bubble) bubble.bubble.classList.remove('caret');
       var code = e && e.code ? e.code : 'upstream_error';
-      if (code === 'session_invalid' && !state.renewed) renew = true;      // the chat expired on Vapi's side: start fresh once
+      var curMode = state.mode || CFG.noteMode;
+      if (window.console && e && e.detail && /^(key_rejected|bad_request)$/.test(code)) console.warn('[hudson-chat] Vapi answered ' + (e.status || '') + ': ' + e.detail + (code === 'key_rejected' ? ' | Check data-public-key, Allowed Origins and Allowed Assistants for the key in the Vapi dashboard.' : ''));
+      if (code === 'session_invalid' && !state.renewed) renew = true;                               // the chat expired on Vapi's side: start fresh once
+      else if (code === 'bad_request' && !usedSession && !state.fellBack && (curMode === 'developer' || curMode === 'system')) fallback = true;   // Vapi did not accept a non-user role: send the note inside the first user message instead
       else showError(code === 'session_invalid' ? 'upstream_error' : code);
     } finally {
       clearTimeout(killer); state.abort = null; state.busy = false; setBusy(false);
     }
+    if (fallback) { state.mode = 'user_prefix'; state.fellBack = true; persist(); hideTyping(); return run(text, true); }
     if (renew) {
       state.renewed = true; state.sid = ''; hideTyping();
       addNote('Your earlier chat expired, so I started a fresh one.');
@@ -472,6 +601,7 @@
     text = String(text == null ? els.input.value : text).trim();
     if (!text || state.busy) return false;
     if (text.length > CFG.maxChars) { state.lastText = ''; showError('message_too_long', true); return false; }
+    if (state.msgs.filter(function (m) { return m.r === 'u'; }).length >= MAX_USER_TURNS) { state.lastText = ''; showError('session_limit'); return false; }   // a long chat costs money: ask the visitor to start a new one
     els.confirm.hidden = true;
     state.chipsDone = true; els.chips.hidden = true;
     addRow('u', text);
@@ -586,7 +716,7 @@
   }
 
   window.HudsonChat = {
-    version: '1.0.0',
+    version: '2.0.0',
     open: function () { open(); }, close: function () { close(); },
     toggle: function () { if (state.open) close(); else open(); },
     newChat: function () { newChat(true); },
