@@ -1,2 +1,2 @@
-/* Demo settings (written by scripts\deploy-widget). api: address of the chat proxy. live: true once live chat works. */
-window.HF_DEMO = { api: '', live: false };
+/* Demo settings (written by scripts\deploy-widget). publicKey: your Vapi PUBLIC key. live: true once live chat works. */
+window.HF_DEMO = { publicKey: '', live: false };
