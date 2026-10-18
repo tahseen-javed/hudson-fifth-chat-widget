@@ -1,5 +1,5 @@
 /* Simulated chat backend for the demo page ONLY.
- * It answers the widget's requests locally (same streaming format as the real proxy) so the design can be tried
+ * It answers the widget's requests locally, in the same streaming format Vapi's browser chat route uses, so the design can be tried
  * before the live assistant is connected. It does not talk to Vapi and books nothing. */
 (function () {
   'use strict';
@@ -55,37 +55,44 @@
     return 'I can help with rentals, sales and viewings. What are you looking for?';
   }
 
+  function visitorText(input) {
+    var t = '';
+    if (typeof input === 'string') t = input;
+    else if (Array.isArray(input)) for (var i = input.length - 1; i >= 0; i--) if (input[i].role === 'user') { t = String(input[i].content || ''); break; }
+    var k = t.indexOf('Visitor message: ');
+    return k === -1 ? t : t.slice(k + 17);
+  }
+
   function install(base) {
     var sessions = {};
     var enc = new TextEncoder();
     window.fetch = function (input, init) {
       var url = typeof input === 'string' ? input : input.url;
-      if (url.indexOf(base + '/v1/chat') !== 0) return realFetch(input, init);
+      if (url.indexOf(base + '/chat/web') !== 0) return realFetch(input, init);
       var body = {}; try { body = JSON.parse(init.body); } catch (e) { /* ignore */ }
-      var text = String(body.message || '');
+      var text = visitorText(body.input);
+      var sid = body.sessionId && sessions[body.sessionId] ? body.sessionId : 'sim_' + Math.random().toString(36).slice(2, 10);
       if (/test error|#error/i.test(text)) {
-        return Promise.resolve(new Response(JSON.stringify({ ok: false, error: { code: 'chat_unavailable' } }), { status: 503, headers: { 'Content-Type': 'application/json' } }));
+        var errStream = new ReadableStream({ start: function (c) { c.enqueue(enc.encode('data: ' + JSON.stringify({ error: true, message: 'Add a payment method to use chat. (simulated error)' }) + '\n\n')); c.close(); } });
+        return Promise.resolve(new Response(errStream, { status: 201, headers: { 'Content-Type': 'text/event-stream' } }));
       }
-      var sid = body.sid && sessions[body.sid] ? body.sid : 'sim.' + Math.random().toString(36).slice(2, 10);
-      var st = sessions[sid] || (sessions[sid] = { step: '', turn: 0 });
-      st.turn++;
+      var st = sessions[sid] || (sessions[sid] = { step: '' });
       var answer = reply(text, st);
       var words = answer.match(/\S+\s*|\n/g) || [answer];
       var stream = new ReadableStream({
         start: function (c) {
-          var send = function (ev, d) { c.enqueue(enc.encode('event: ' + ev + '\ndata: ' + JSON.stringify(d) + '\n\n')); };
+          var chunk = function (delta) { c.enqueue(enc.encode('data: ' + JSON.stringify({ id: 'sim', sessionId: sid, path: 'chat.output[0].content', delta: delta }) + '\n\n')); };
           var i = 0;
           setTimeout(function () {
-            send('session', { sid: sid, turn: st.turn });
             (function tick() {
-              if (i >= words.length) { send('done', { turn: st.turn, chars: answer.length }); c.close(); return; }
-              send('delta', { text: words[i++] });
+              if (i >= words.length) { c.enqueue(enc.encode('data: [DONE]\n\n')); c.close(); return; }
+              chunk(words[i++]);
               setTimeout(tick, 28 + Math.random() * 40);
             })();
           }, 650 + Math.random() * 450);
         }
       });
-      return Promise.resolve(new Response(stream, { status: 200, headers: { 'Content-Type': 'text/event-stream; charset=utf-8' } }));
+      return Promise.resolve(new Response(stream, { status: 201, headers: { 'Content-Type': 'text/event-stream' } }));
     };
   }
 
