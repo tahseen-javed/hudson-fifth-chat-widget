@@ -157,7 +157,7 @@
         <ul class="tips">
           <li>Floating gold-and-navy button, bottom right. Full screen on phones.</li>
           <li>Options go on the same tag, for example <code>data-theme="dark"</code>, <code>data-position="left"</code>, <code>data-open="true"</code>.</li>
-          <li>Only websites on your allowed list can use the chat. Nothing secret is in the page.</li>
+          <li>No secret is in the page, only Vapi's <em>public</em> key. In the Vapi dashboard you limit that key to your websites (Allowed Origins) and to this one assistant (Allowed Assistants).</li>
         </ul>
       </div>
     </div>
@@ -177,25 +177,24 @@
 (function () {
   var cfg = window.HF_DEMO || {};
   var q = new URLSearchParams(location.search);
-  var mode = q.get('mode') || (cfg.live && cfg.api ? 'live' : 'sim');
-  if (mode === 'live' && !cfg.api) mode = 'sim';
+  var mode = q.get('mode') || (cfg.live && cfg.publicKey ? 'live' : 'sim');
+  if (mode === 'live' && !cfg.publicKey) mode = 'sim';
   var here = new URL('.', location.href).href;
   var SIM_API = 'https://sim.invalid';
-  var api = mode === 'live' ? cfg.api : SIM_API;
 
   // mode switch
   document.getElementById('mode-sim').setAttribute('aria-current', String(mode === 'sim'));
   document.getElementById('mode-live').setAttribute('aria-current', String(mode === 'live'));
   document.getElementById('mode-note').innerHTML = mode === 'sim'
-    ? '<strong>Simulated replies.</strong> This page is answering with a scripted demo so you can try the design. It is not connected to the live assistant' + (cfg.api ? '' : ' yet') + ' and books nothing.'
-    : '<strong>Live assistant.</strong> Your messages go to the real Hudson &amp; Fifth assistant. Bookings are real.';
+    ? '<strong>Simulated replies.</strong> This page is answering with a scripted demo so you can try the design. It is not connected to the live assistant' + (cfg.publicKey ? '' : ' yet') + ' and books nothing.'
+    : '<strong>Live assistant.</strong> Your messages go from your browser straight to Vapi and the real Hudson &amp; Fifth assistant. Bookings are real.';
   if (mode === 'sim') window.HudsonChatSim.install(SIM_API);
 
   // the widget (same tag a customer would paste, plus demo options)
   var s = document.createElement('script');
   s.src = here + 'hudson-chat.js';
   s.defer = true;
-  s.dataset.api = api;
+  if (mode === 'sim') { s.dataset.publicKey = 'simulated-demo'; s.dataset.apiUrl = SIM_API; } else s.dataset.publicKey = cfg.publicKey;
   s.dataset.phone = '(212) 555-0142';
   s.dataset.email = 'hello@hudsonfifthrealty.com';
   if (q.get('open')) s.dataset.open = 'true';
@@ -203,9 +202,8 @@
   document.body.appendChild(s);
   ['nav-chat', 'hero-chat'].forEach(function (id) { document.getElementById(id).addEventListener('click', function () { if (window.HudsonChat) window.HudsonChat.open(); }); });
 
-  // the exact snippet to copy (the live address once it exists, a placeholder before that)
-  var liveApi = cfg.api || 'https://YOUR-CHAT-PROXY.workers.dev';
-  var snippet = '<script src="' + here + 'hudson-chat.js"\n        data-api="' + liveApi + '"\n        data-phone="(212) 555-0142"\n        data-email="hello@hudsonfifthrealty.com"\n        defer><\/script>';
+  // the exact snippet to copy: your own public key goes where the placeholder is
+  var snippet = '<script src="' + here + 'hudson-chat.js"\n        data-public-key="YOUR_VAPI_PUBLIC_KEY"\n        data-phone="(212) 555-0142"\n        data-email="hello@hudsonfifthrealty.com"\n        defer><\/script>';
   var pre = document.getElementById('snippet');
   pre.textContent = snippet;
   document.getElementById('copy').addEventListener('click', function () {
